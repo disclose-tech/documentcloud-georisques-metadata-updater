@@ -31,7 +31,7 @@ PROGRESS_EVERY = 1000
 # is one document whose processing raised after its retries — usually a save that
 # exhausted its 429 backoff). Guards against grinding on while DocumentCloud is
 # hard rate-limiting or otherwise broken.
-MAX_GIVE_UPS = 10
+MAX_GIVE_UPS = 5
 
 
 class GeorisquesMetadataUpdater(AddOn):
