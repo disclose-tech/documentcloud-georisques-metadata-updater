@@ -6,11 +6,11 @@ properties:
   project:
     title: Project
     type: integer
-    description: ID of the project holding the Georisques document
+    description: ID of the project holding the Georisques documents
   time_limit:
     title: Time limit
     type: integer
-    description: Maximum number of minutes the Add-On should run for.
+    description: Maximum number of minutes the Add-On should run for. 0 = no limit.
     default: 345
   dry_run:
     title: Dry run
