@@ -1,2 +1,5 @@
 python-documentcloud==4.5.0
+ftfy
+pandas
 requests
+tenacity

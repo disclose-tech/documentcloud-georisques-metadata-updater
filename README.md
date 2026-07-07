@@ -1,16 +1,35 @@
-
-# DocumentCloud Add-On
+# Géorisques Metadata Updater — DocumentCloud Add-On
 
 [Please see the Add-On documentation](https://github.com/MuckRock/documentcloud-hello-world-addon/wiki/)
 
-# DocumentCloud Hello World Add-On
+This Add-On keeps the **installation-level metadata** of already-uploaded Géorisques
+documents in sync with the latest Géorisques source data. It is the maintenance
+counterpart to the Géorisques scraper (`documentcloud-georisques-scraper`, which does the
+initial upload): the scraper stamps each document with an `installation_aiot_code`, and this
+Add-On revisits those documents and refreshes their `installation_*` metadata from the
+current Géorisques CSV export.
 
-This repository contains an example Add-On for DocumentCloud.  It is designed
-to be copied and modified to allow one to easily write Add-Ons to bring custom
-functionality to DocumentCloud.  Please use the green "Use this Template"
-button to create a new repository instead of forking.  This will be easier as
-the new Add-On will diverge significantly from this code base.
+## What it does
 
-After copying the template, remember to update this README file to describe
-your new Add-On!  It is a good idea to leave the link to the Add-On
-documentation at the top of the file though.
+On each run it:
+
+1. Downloads the full Géorisques *installations classées* CSV export
+   (`InstallationClassee.csv` + `rubriqueIC.csv`, paginated at 6000 rows/page) and builds
+   an installations table indexed by `codeAiot` plus a per-installation index of unique
+   ICPE rubrique numbers.
+2. Processes the target project's documents as a **resumable queue**, stamping a
+   `last_metadata_update` timestamp on every document it touches:
+   - **Phase 1** — documents with no `last_metadata_update` yet.
+   - **Phase 2** — previously-updated documents, least-recently-updated first, bounded to
+     documents stamped *before this run started* so a run never re-processes its own writes.
+   Because progress is persisted per-document, a crash or a time-limit exit simply resumes
+   on the next run.
+3. For each document, looks up its `installation_aiot_code` in the CSV and updates the
+   `installation_*` metadata keys that have changed (list-valued keys such as
+   `installation_nomenclature_sections` and `installation_topics` are compared as sets, so
+   re-ordering is not a change). Documents whose `installation_aiot_code` is missing or not
+   found in the CSV are stamped and left otherwise untouched, so they leave the queue.
+
+**Scope:** only installation-level metadata (`installation_*`) is reconciled. Per-document
+file-level fields (date, file id, source URLs, doc type, …) and geocoder-derived
+`departments` are left untouched.
