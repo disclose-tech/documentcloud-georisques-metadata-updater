@@ -25,3 +25,10 @@ properties:
 categories: 
   - bulk
 version: 2
+
+eventOptions:
+  name: project
+  events:
+    - hourly
+    - daily
+    - weekly
