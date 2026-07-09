@@ -19,6 +19,7 @@ from tenacity import (
     before_sleep_log,
     retry,
     retry_if_exception,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
@@ -30,18 +31,7 @@ CSV_ENDPOINT = "https://georisques.gouv.fr/api/v1/csv/installations_classees?pag
 DOWNLOAD_FOLDER = "downloaded_files"
 
 
-# ---------------------------------------------------------------------------
-# Géorisques source parsing/mapping — SELF-CONTAINED, kept identical to the
-# scraper (documentcloud-georisques-scraper). These functions are pure and are
-# meant to be copy-pasted between the two add-ons; if you change one here, mirror
-# it there. The scraper's equivalents live in:
-#   scraper/spiders/georisques_csv.py  (loading + add_installation_metadata/adress)
-#   scraper/pipelines.py               (CleanTextPipeline ftfy repair +
-#                                        UploadPipeline item->data-key mapping)
-# Only the download/pagination loop (load_georisques_data below) is add-on
-# specific — the scraper downloads via scrapy, the updater via requests.
-# ---------------------------------------------------------------------------
-
+# Géorisques source parsing/mapping
 # InstallationClassee.csv column -> DocumentCloud installation-level data key.
 INSTALLATION_FIELD_MAP = {
     "codeNaf": "installation_naf_code",
@@ -135,13 +125,23 @@ def build_installation_data(code_aiot, df_installations, rubriques_by_aiot):
     return data
 
 
+@retry(
+    retry=retry_if_exception_type(requests.RequestException),
+    wait=wait_exponential(multiplier=1, max=30),
+    stop=stop_after_attempt(3),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+def _download_csv_page(url):
+    """GET one Géorisques CSV page; bounded timeout + retry on transient errors."""
+    response = requests.get(url, timeout=(10, 120))  # (connect, read)
+    response.raise_for_status()
+    return response.content
+
+
 def load_georisques_data():
     """Download every Géorisques CSV page and build the installations table +
     the rubriques index.
-
-    Download/pagination is updater-specific (a plain requests loop); the per-file
-    parsing delegates to the shared read_* helpers so the result matches the
-    scraper. Stops on the first page holding fewer than PAGE_SIZE installations.
     """
     os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
@@ -153,12 +153,9 @@ def load_georisques_data():
         url = CSV_ENDPOINT.format(page_size=PAGE_SIZE, page=page)
         logger.info(f"Downloading installations CSV page {page}...")
 
-        response = requests.get(url)
-        response.raise_for_status()
-
         zip_path = os.path.join(DOWNLOAD_FOLDER, f"georisques_csv_page_{page}.zip")
         with open(zip_path, "wb") as f:
-            f.write(response.content)
+            f.write(_download_csv_page(url))
 
         extracted_path = os.path.join(DOWNLOAD_FOLDER, f"georisques_csv_page_{page}")
         with zipfile.ZipFile(zip_path) as archive:
@@ -187,7 +184,7 @@ def load_georisques_data():
 # ---------------------------------------------------------------------------
 
 def first_value(value):
-    """DocumentCloud data values come back as lists; return the first scalar."""
+    """DocumentCloud data values come back as lists; returns the first."""
     if isinstance(value, list):
         return value[0] if value else None
     return value
@@ -196,8 +193,7 @@ def first_value(value):
 def normalize(value):
     """Order-insensitive comparison form: sorted list of stringified values.
 
-    Handles both scalar and list-valued data keys, so the list fields
-    (installation_nomenclature_sections, installation_topics) diff as sets.
+    Handles both single and list-valued data keys.
     """
     if value is None:
         return []
@@ -211,10 +207,7 @@ def utcnow_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ---------------------------------------------------------------------------
 # Rate-limit-aware saving
-# ---------------------------------------------------------------------------
-
 def is_rate_limited(exc):
     """True for a DocumentCloud 429 (Too Many Requests) response."""
     return isinstance(exc, APIError) and getattr(exc, "status_code", None) == 429
@@ -229,13 +222,5 @@ def is_rate_limited(exc):
     reraise=True,
 )
 def save_with_backoff(document):
-    """Persist a document, retrying with exponential backoff on 429s.
-
-    The DocumentCloud/squarelet client retries a 429 only once (to refresh
-    tokens) and its transport-level retry covers 500/502/504 but not 429. Saves
-    are the usual rate-limit choke point, so we add real backoff (~1s→15s, up to
-    3 attempts) on top. Non-429 errors propagate immediately; after the attempts
-    are exhausted the last 429 is re-raised so the caller leaves the document
-    unstamped for a later run.
-    """
+    """Persist a document, retrying with exponential backoff on 429s."""
     document.save()

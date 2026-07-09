@@ -18,19 +18,13 @@ logging.basicConfig(
     stream=sys.stdout,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-# The DocumentCloud/squarelet client logs every HTTP request at INFO (very noisy,
-# one line per API call incl. the full PUT body); quiet it to WARNING so our own
-# progress/diff logs stay readable.
 logging.getLogger("squarelet").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Log a running total every this many processed documents.
+# Log progress every this many processed documents.
 PROGRESS_EVERY = 1000
 
-# Abort the whole run once this many documents have failed to update (a "give-up"
-# is one document whose processing raised after its retries — usually a save that
-# exhausted its 429 backoff). Guards against grinding on while DocumentCloud is
-# hard rate-limiting or otherwise broken.
+# Abort the whole run once this many documents have failed to update
 MAX_GIVE_UPS = 5
 
 
@@ -73,8 +67,6 @@ class GeorisquesMetadataUpdater(AddOn):
         - No matching installation -> stamp last_metadata_update only (the doc
           leaves the queue), change nothing else.
         - Otherwise -> update the installation_* keys that differ, then stamp.
-        In dry-run mode nothing is written; the changes that *would* be made are
-        logged instead (and last_metadata_update is left untouched).
         """
         if document.data is None:
             document.data = {}
@@ -115,8 +107,8 @@ class GeorisquesMetadataUpdater(AddOn):
             self.log_changes(document, changes, prefix="[dry-run] ")
             return
 
-        # Non-dry run: don't log per-doc changes (only the every-100 progress and
-        # the final total are printed); just apply and save.
+        # Non-dry run: don't log per-doc changes (only the every-X progress and
+        # the final total are printed).
         for key, (_old, new_value) in changes.items():
             document.data[key] = new_value
         self.stamp_and_save(document)
@@ -154,7 +146,7 @@ class GeorisquesMetadataUpdater(AddOn):
 
         self.start_time = datetime.now(timezone.utc)
 
-        # Add a custom user agent here to positively identify yourself
+        # Add a custom user agent here to positively identify the Add-On
         self.client.session.headers.update(
             {"User-Agent": "Disclose Georisques Metadata Updater Add-On"}
         )
@@ -164,6 +156,7 @@ class GeorisquesMetadataUpdater(AddOn):
         self.time_limit = self.data["time_limit"]
         self.dry_run = self.data.get("dry_run", False)
         self.max_documents = self.data.get("max_documents", 0)
+
         self.processed_count = 0
         self.failure_count = 0
 
@@ -187,8 +180,7 @@ class GeorisquesMetadataUpdater(AddOn):
 
             # 2 Already-updated documents, least-recently-updated first.
             # Bound to documents stamped BEFORE this run started so a run never
-            # re-processes what it just wrote (the docs stamped in phase 1, or its
-            # own phase-2 writes). The range value has colons, hence the quoting.
+            # re-processes the docs that were updated in Phase 1.
             logger.info("Phase 2: previously-updated documents (least recently first)...")
             start_token = self.start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
             already_updated_docs = self.client.documents.search(
