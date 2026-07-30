@@ -17,6 +17,13 @@ properties:
     type: boolean
     description: If checked, no document is modified; the changes that would be made are logged instead.
     default: false
+  beautify_titles:
+    title: Beautify document titles
+    type: boolean
+    description: >-
+      If checked, documents that have no original_filename metadata get their current
+      title saved to original_filename and their title beautified.
+    default: false
   max_documents:
     title: Max documents
     type: integer

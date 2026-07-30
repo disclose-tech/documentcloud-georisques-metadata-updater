@@ -5,6 +5,7 @@ import sys
 from documentcloud.addon import AddOn
 
 from utils import (
+    beautify_title,
     build_installation_data,
     first_value,
     load_georisques_data,
@@ -54,6 +55,26 @@ class GeorisquesMetadataUpdater(AddOn):
         for key, (old, new) in sorted(changes.items()):
             logger.info(f"{prefix}    {key}: {old!r} -> {new!r}")
 
+    def beautify_document_title(self, document):
+        """Preserve the raw title in original_filename, then beautify the title."""
+        if not self.beautify_titles:
+            return None
+        if first_value(document.data.get("original_filename")):
+            return None
+
+        original = document.title
+        beautified = beautify_title(original)
+
+        if not self.dry_run:
+            document.data["original_filename"] = original
+            document.title = beautified
+
+        if beautified == original:
+            return None
+
+        self.title_count += 1
+        return (original, beautified)
+
     def stamp_and_save(self, document):
         """Set last_metadata_update to now and persist the document."""
         if document.data is None:
@@ -70,6 +91,13 @@ class GeorisquesMetadataUpdater(AddOn):
         """
         if document.data is None:
             document.data = {}
+
+        title_change = self.beautify_document_title(document)
+        if title_change and self.dry_run:
+            old_title, new_title = title_change
+            logger.info(
+                f"[dry-run] Document {document.id}: title {old_title!r} -> {new_title!r}"
+            )
 
         code_aiot = first_value(document.data.get("installation_aiot_code"))
         target = (
@@ -156,12 +184,18 @@ class GeorisquesMetadataUpdater(AddOn):
         self.time_limit = self.data["time_limit"]
         self.dry_run = self.data.get("dry_run", False)
         self.max_documents = self.data.get("max_documents", 0)
+        self.beautify_titles = self.data.get("beautify_titles", False)
 
         self.processed_count = 0
         self.failure_count = 0
+        self.title_count = 0
 
         if self.dry_run:
             logger.info("Running in DRY-RUN mode: no document will be modified.")
+        if self.beautify_titles:
+            logger.info(
+                "Beautifying the titles of documents that have no original_filename."
+            )
 
         # Fetch & load Géorisques data (installations table + rubriques index)
         self.df_installations, self.rubriques_by_aiot = load_georisques_data()
@@ -192,7 +226,11 @@ class GeorisquesMetadataUpdater(AddOn):
         finally:
             # Always report the total, whatever ended the run: natural completion,
             # the max_documents cap, the time limit (sys.exit), or the give-up abort.
-            logger.info(f"Run finished. Processed {self.processed_count} documents.")
+            summary = f"Run finished. Processed {self.processed_count} documents."
+            if self.beautify_titles:
+                verb = "would be beautified" if self.dry_run else "beautified"
+                summary += f" {self.title_count} title(s) {verb}."
+            logger.info(summary)
 
 
 if __name__ == "__main__":

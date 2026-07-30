@@ -9,6 +9,7 @@ Holds the framework-agnostic helpers used by ``main.py``:
 from datetime import datetime, timezone
 import logging
 import os
+import re
 import zipfile
 
 from documentcloud.exceptions import APIError
@@ -205,6 +206,29 @@ def normalize(value):
 def utcnow_iso():
     """Fixed-width ISO-8601 UTC so lexical order == chronological order."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Title beautifying
+# File extensions to drop from the end of a title. Whitelisted deliberately
+# to avoid removing legitimate title fragments
+TITLE_EXTENSIONS = ["pdf", "pdfa", "doc", "docx", "odt", "rtf", "txt"]
+
+# Remove one or more of those extensions at the very end of the title
+TITLE_EXTENSIONS_RE = re.compile(
+    r"(?:\s*\.(?:" + "|".join(TITLE_EXTENSIONS) + r"))+$", re.IGNORECASE
+)
+
+
+def beautify_title(title):
+    """Turn a source filename into a human-readable document title.
+    """
+    beautified = title.replace("_", " ")
+
+    beautified = re.sub(r"\s+", " ", beautified).strip()
+
+    beautified = TITLE_EXTENSIONS_RE.sub("", beautified).strip()
+
+    return beautified or title
 
 
 # Rate-limit-aware saving
