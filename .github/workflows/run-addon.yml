@@ -7,3 +7,4 @@ jobs:
     uses: MuckRock/documentcloud-addon-workflows/.github/workflows/run-addon.yml@v1
     with:
       timeout: 345
+      python-version: "3.13"

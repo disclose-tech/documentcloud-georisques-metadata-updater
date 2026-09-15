@@ -1,0 +1,12 @@
+# Runtime dependencies. Edit this file, then regenerate the lock with:
+#
+#     pip-compile --strip-extras requirements.in -o requirements.txt
+#
+# Add --upgrade to that command to pull in newer versions, and review the diff.
+# requirements.txt is what the Add-On runner installs, so it stays committed.
+
+python-documentcloud
+ftfy
+pandas
+requests
+tenacity
