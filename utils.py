@@ -129,13 +129,13 @@ def build_installation_data(code_aiot, df_installations, rubriques_by_aiot):
 @retry(
     retry=retry_if_exception_type(requests.RequestException),
     wait=wait_exponential(multiplier=1, max=30),
-    stop=stop_after_attempt(3),
+    stop=stop_after_attempt(5),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
 def _download_csv_page(url):
     """GET one Géorisques CSV page; bounded timeout + retry on transient errors."""
-    response = requests.get(url, timeout=(10, 120))  # (connect, read)
+    response = requests.get(url, timeout=(60, 300))  # (connect, read)
     response.raise_for_status()
     return response.content
 
