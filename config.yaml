@@ -1,5 +1,7 @@
 title: "Disclose Georisques Metadata Updater Add-On"
-description: Add-On to update metadata of Georisques documents
+description: >-
+  Compares every Georisques document's installation metadata with the latest Georisques CSV
+  and updates the documents that differ.
 type: object
 documents: []
 properties:
@@ -10,24 +12,18 @@ properties:
   time_limit:
     title: Time limit
     type: integer
-    description: Maximum number of minutes the Add-On should run for. 0 = no limit.
-    default: 345
+    description: >-
+      Maximum number of minutes the Add-On should run for. 0 = no limit.
+    default: 330
   dry_run:
     title: Dry run
     type: boolean
     description: If checked, no document is modified; the changes that would be made are logged instead.
     default: false
-  beautify_titles:
-    title: Beautify document titles
-    type: boolean
-    description: >-
-      If checked, documents that have no original_filename metadata get their current
-      title saved to original_filename and their title beautified.
-    default: false
   max_documents:
     title: Max documents
     type: integer
-    description: Maximum number of documents to process in a run (across both phases). 0 = no limit.
+    description: Maximum number of documents to read in a run. 0 = no limit.
     default: 0
 categories: 
   - bulk

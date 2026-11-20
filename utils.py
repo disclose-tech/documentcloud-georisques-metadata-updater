@@ -1,15 +1,6 @@
-"""Utilities for the Géorisques Metadata Updater add-on.
-
-Holds the framework-agnostic helpers used by ``main.py``:
-- the Géorisques CSV parsing/mapping (kept in sync with the scraper),
-- small DocumentCloud ``data`` helpers, and
-- the 429-aware save-with-backoff wrapper.
-"""
-
-from datetime import datetime, timezone
 import logging
 import os
-import re
+import time
 import zipfile
 
 from documentcloud.exceptions import APIError
@@ -27,8 +18,12 @@ from tenacity import (
 
 logger = logging.getLogger(__name__)
 
-PAGE_SIZE = 6000
+# Géorisques always cuts a CSV page of ~1.4 MB mid-download (6000 rows, 2026-11-20)
+PAGE_SIZE = 2000
 CSV_ENDPOINT = "https://georisques.gouv.fr/api/v1/csv/installations_classees?page_size={page_size}&page={page}"
+CSV_HEADERS = {"User-Agent": "Disclose Georisques Metadata Updater Add-On - contact tech@disclose.ngo"}
+# Seconds between two CSV pages
+PAGE_DELAY = 5
 DOWNLOAD_FOLDER = "downloaded_files"
 
 
@@ -128,14 +123,15 @@ def build_installation_data(code_aiot, df_installations, rubriques_by_aiot):
 
 @retry(
     retry=retry_if_exception_type(requests.RequestException),
-    wait=wait_exponential(multiplier=1, max=30),
+    # 15, 30, 60 then 120 s between attempts
+    wait=wait_exponential(multiplier=15, max=120),
     stop=stop_after_attempt(5),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
 def _download_csv_page(url):
     """GET one Géorisques CSV page; bounded timeout + retry on transient errors."""
-    response = requests.get(url, timeout=(60, 300))  # (connect, read)
+    response = requests.get(url, headers=CSV_HEADERS, timeout=(60, 300))  # (connect, read)
     response.raise_for_status()
     return response.content
 
@@ -174,6 +170,7 @@ def load_georisques_data():
             break
 
         page += 1
+        time.sleep(PAGE_DELAY)
 
     df_installations = pd.concat(installations_frames)
     rubriques_by_aiot = {aiot: sorted(nums) for aiot, nums in rubriques_sets.items()}
@@ -185,17 +182,12 @@ def load_georisques_data():
 # ---------------------------------------------------------------------------
 
 def first_value(value):
-    """DocumentCloud data values come back as lists; returns the first."""
     if isinstance(value, list):
         return value[0] if value else None
     return value
 
 
-def normalize(value):
-    """Order-insensitive comparison form: sorted list of stringified values.
-
-    Handles both single and list-valued data keys.
-    """
+def normalize_for_comparison(value):
     if value is None:
         return []
     if isinstance(value, list):
@@ -203,48 +195,82 @@ def normalize(value):
     return [str(value)]
 
 
-def utcnow_iso():
-    """Fixed-width ISO-8601 UTC so lexical order == chronological order."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+# Every key build_installation_data() can emit: one the CSV no longer provides is deleted
+MANAGED_KEYS = set(INSTALLATION_FIELD_MAP.values()) | {
+    "installation_topics",
+    "installation_nomenclature_sections",
+    "installation_address",
+}
 
 
-# Title beautifying
-# File extensions to drop from the end of a title. Whitelisted deliberately
-# to avoid removing legitimate title fragments
-TITLE_EXTENSIONS = ["pdf", "pdfa", "doc", "docx", "odt", "rtf", "txt"]
+def updated_data(data, target):
+    """Apply the CSV values in ``target`` to a document's ``data``.
 
-# Remove one or more of those extensions at the very end of the title
-TITLE_EXTENSIONS_RE = re.compile(
-    r"(?:\s*\.(?:" + "|".join(TITLE_EXTENSIONS) + r"))+$", re.IGNORECASE
-)
-
-
-def beautify_title(title):
-    """Turn a source filename into a human-readable document title.
+    Returns the complete new ``data`` (a bulk update replaces it, it does not merge)
+    and the changes as ``{key: (old, new)}``, ``new`` being None for a deleted key.
+    Returns ``(None, {})`` when nothing differs.
     """
-    beautified = title.replace("_", " ")
+    changes = {}
+    for key in sorted(MANAGED_KEYS):
+        old, new = data.get(key), target.get(key)
+        if normalize_for_comparison(old) != normalize_for_comparison(new):
+            changes[key] = (old, new)
+    if not changes:
+        return None, {}
 
-    beautified = re.sub(r"\s+", " ", beautified).strip()
+    new_data = dict(data)
+    for key, (_old, new) in changes.items():
+        if new is None:
+            del new_data[key]
+        else:
+            new_data[key] = new
+    return new_data, changes
 
-    beautified = TITLE_EXTENSIONS_RE.sub("", beautified).strip()
 
-    return beautified or title
+# Bulk writes
+# DocumentCloud's REST_BULK_LIMIT
+BULK_LIMIT = 25
+
+# A PUT is a full update: these fall back to private / eng / pdf when left out
+REQUIRED_FIELDS = ["access", "language", "original_extension"]
+
+# What `Document.save()` sends, plus `original_extension`
+PUT_FIELDS = [
+    "access",
+    "data",
+    "description",
+    "language",
+    "original_extension",
+    "publish_at",
+    "published_url",
+    "related_article",
+    "source",
+    "title",
+]
 
 
-# Rate-limit-aware saving
-def is_rate_limited(exc):
-    """True for a DocumentCloud 429 (Too Many Requests) response."""
-    return isinstance(exc, APIError) and getattr(exc, "status_code", None) == 429
+def put_item(document, data):
+    """One bulk PUT entry: the document's writable fields with ``data`` replaced."""
+    item = {"id": document.id}
+    item |= {field: getattr(document, field) for field in PUT_FIELDS if hasattr(document, field)}
+    item["data"] = data
+    return item
+
+
+def is_transient(exc):
+    """A 429, a 5xx or a network failure; a 400 would fail the same way again."""
+    if isinstance(exc, APIError):
+        return exc.status_code == 429 or (exc.status_code or 0) >= 500
+    return isinstance(exc, requests.RequestException)
 
 
 @retry(
-    retry=retry_if_exception(is_rate_limited),
-    # 3 attempts, exponential backoff ~1s then ~12s (capped at 15s).
-    wait=wait_exponential(multiplier=1, exp_base=12, min=1, max=15),
+    retry=retry_if_exception(is_transient),
+    wait=wait_exponential(multiplier=1, max=30),
     stop=stop_after_attempt(3),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
-def save_with_backoff(document):
-    """Persist a document, retrying with exponential backoff on 429s."""
-    document.save()
+def put_batch(client, items):
+    # The client throttles `PUT documents/` itself (12 calls/min, 25 documents each)
+    client.put("documents/", json=items)

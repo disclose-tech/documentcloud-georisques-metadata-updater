@@ -1,17 +1,20 @@
+from collections import Counter
 from datetime import datetime, timezone
 import logging
 import sys
 
 from documentcloud.addon import AddOn
+from documentcloud.exceptions import APIError
 
 from utils import (
-    beautify_title,
+    BULK_LIMIT,
+    REQUIRED_FIELDS,
     build_installation_data,
     first_value,
     load_georisques_data,
-    normalize,
-    save_with_backoff,
-    utcnow_iso,
+    put_batch,
+    put_item,
+    updated_data,
 )
 
 logging.basicConfig(
@@ -22,152 +25,106 @@ logging.basicConfig(
 logging.getLogger("squarelet").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Log progress every this many processed documents.
-PROGRESS_EVERY = 1000
+# Log progress every this many read documents.
+PROGRESS_EVERY = 10000
+
+# The API's maximum; reading the whole project is what bounds a run
+PER_PAGE = 100
 
 # Abort the whole run once this many documents have failed to update
 MAX_GIVE_UPS = 5
 
 
 class GeorisquesMetadataUpdater(AddOn):
-    """An Add-On for DocumentCloud."""
+    """Reconciles every document's installation metadata with the Géorisques CSV."""
 
     def check_time_limit(self):
-
         if self.time_limit != 0:
-
             limit_in_seconds = self.time_limit * 60
             elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
 
             if elapsed > limit_in_seconds:
                 logger.info(f"Closing due to time limit ({self.time_limit} minutes).")
+                self.flush()
                 sys.exit(0)
 
     def doc_label(self, document):
         return f'Document {document.id} "{document.title}"'
 
-    def log_changes(self, document, changes, prefix=""):
-        label = self.doc_label(document)
-        if not changes:
-            logger.info(f"{prefix}{label}: no metadata changes.")
-            return
-        logger.info(f"{prefix}{label}: {len(changes)} field(s) to update:")
-        for key, (old, new) in sorted(changes.items()):
-            logger.info(f"{prefix}    {key}: {old!r} -> {new!r}")
-
-    def beautify_document_title(self, document):
-        """Preserve the raw title in original_filename, then beautify the title."""
-        if not self.beautify_titles:
-            return None
-        if first_value(document.data.get("original_filename")):
-            return None
-
-        original = document.title
-        beautified = beautify_title(original)
-
-        if not self.dry_run:
-            document.data["original_filename"] = original
-            document.title = beautified
-
-        if beautified == original:
-            return None
-
-        self.title_count += 1
-        return (original, beautified)
-
-    def stamp_and_save(self, document):
-        """Set last_metadata_update to now and persist the document."""
-        if document.data is None:
-            document.data = {}
-        document.data["last_metadata_update"] = utcnow_iso()
-        save_with_backoff(document)
+    def log_changes(self, document, changes):
+        logger.info(f"[dry-run] {self.doc_label(document)}: {len(changes)} field(s) to update:")
+        for key, (old, new) in changes.items():
+            if new is None:
+                logger.info(f"[dry-run]     {key}: {old!r} -> deleted")
+            else:
+                logger.info(f"[dry-run]     {key}: {old!r} -> {new!r}")
 
     def update_metadata(self, document):
-        """Reconcile one document's installation-level metadata against the CSV.
+        """Queue one document's write when its installation_* keys differ from the CSV.
 
-        - No matching installation -> stamp last_metadata_update only (the doc
-          leaves the queue), change nothing else.
-        - Otherwise -> update the installation_* keys that differ, then stamp.
+        A document with no AIOT code, or one the CSV no longer lists, is left untouched.
         """
-        if document.data is None:
-            document.data = {}
-
-        title_change = self.beautify_document_title(document)
-        if title_change and self.dry_run:
-            old_title, new_title = title_change
-            logger.info(
-                f"[dry-run] Document {document.id}: title {old_title!r} -> {new_title!r}"
-            )
-
-        code_aiot = first_value(document.data.get("installation_aiot_code"))
-        target = (
-            build_installation_data(code_aiot, self.df_installations, self.rubriques_by_aiot)
-            if code_aiot
-            else {}
-        )
-
+        data = document.data or {}
+        code_aiot = first_value(data.get("installation_aiot_code"))
+        if not code_aiot:
+            self.counts["no installation_aiot_code"] += 1
+            return
+        target = build_installation_data(code_aiot, self.df_installations, self.rubriques_by_aiot)
         if not target:
-            reason = (
-                "no installation_aiot_code"
-                if not code_aiot
-                else f"codeAiot '{code_aiot}' not in Géorisques CSV"
-            )
-            if self.dry_run:
-                logger.info(
-                    f"[dry-run] {self.doc_label(document)}: {reason} -> would stamp "
-                    "last_metadata_update only."
-                )
-            else:
-                logger.warning(
-                    f"{self.doc_label(document)}: {reason}; stamping "
-                    "last_metadata_update only."
-                )
-                self.stamp_and_save(document)
+            self.counts["installation_aiot_code not in the CSV"] += 1
             return
 
-        changes = {}
-        for key, new_value in target.items():
-            current_value = document.data.get(key)
-            if normalize(current_value) != normalize(new_value):
-                changes[key] = (current_value, new_value)
+        new_data, changes = updated_data(data, target)
+        if new_data is None:
+            self.counts["unchanged"] += 1
+            return
 
+        missing = [field for field in REQUIRED_FIELDS if getattr(document, field, None) is None]
+        if missing:
+            self.counts["skipped"] += 1
+            logger.warning(f"{self.doc_label(document)}: skipped, no {', '.join(missing)} to send back.")
+            return
+
+        self.counts["changed"] += 1
+        for key, (_old, new) in changes.items():
+            self.key_counts[f"{key} {'deleted' if new is None else 'set'}"] += 1
         if self.dry_run:
-            self.log_changes(document, changes, prefix="[dry-run] ")
+            self.log_changes(document, changes)
             return
 
-        # Non-dry run: don't log per-doc changes (only the every-X progress and
-        # the final total are printed).
-        for key, (_old, new_value) in changes.items():
-            document.data[key] = new_value
-        self.stamp_and_save(document)
+        self.batch.append(put_item(document, new_data))
+        if len(self.batch) >= BULK_LIMIT:
+            self.flush()
 
-    def process_documents(self, documents):
-        """Run update_metadata over a search result, honouring the time limit
-        and the optional max_documents cap (shared across both phases).
+    def flush(self):
+        batch, self.batch = self.batch, []
+        if not batch:
+            return
+        try:
+            put_batch(self.client, batch)
+        except APIError as exc:
+            if exc.status_code != 400 or len(batch) == 1:
+                self.give_up(batch)
+                return
+            # A bulk update is all-or-nothing: retry alone so only the bad document fails
+            for item in batch:
+                self.batch = [item]
+                self.flush()
+        except Exception:  # noqa: BLE001 - keep the run going
+            self.give_up(batch)
+        else:
+            self.saved_count += len(batch)
 
-        A failure on one document is logged and skipped (the doc is left unstamped
-        so it is retried on a later run) rather than aborting the whole batch.
-        """
-        for document in documents:
-            if self.max_documents and self.processed_count >= self.max_documents:
-                logger.info(f"Reached max_documents limit ({self.max_documents}); stopping.")
-                break
-            self.check_time_limit()
-            self.processed_count += 1  # count the doc as processed once we commit to it
-            try:
-                self.update_metadata(document)
-            except Exception as exc:  # noqa: BLE001 - keep the batch going
-                logger.exception(f"Failed to update {self.doc_label(document)}: {exc}")
-                self.failure_count += 1
-                if self.failure_count >= MAX_GIVE_UPS:
-                    logger.error(
-                        f"Aborting run: {self.failure_count} documents failed to update "
-                        f"(max_give_ups={MAX_GIVE_UPS}). DocumentCloud may be rate-limiting "
-                        "or unavailable; the remaining documents will be retried next run."
-                    )
-                    sys.exit(1)
-            if self.processed_count % PROGRESS_EVERY == 0:
-                logger.info(f"Processed {self.processed_count} documents so far...")
+    def give_up(self, batch):
+        logger.exception(f"Failed to update documents {[item['id'] for item in batch]}")
+        self.failure_count += len(batch)
+        if self.failure_count >= MAX_GIVE_UPS:
+            logger.error(
+                f"Aborting run: {self.failure_count} documents failed to update "
+                f"(max_give_ups={MAX_GIVE_UPS}). DocumentCloud may be rate-limiting "
+                "or unavailable; the next run compares every document again."
+            )
+            sys.exit(1)
 
     def main(self):
         """The main add-on functionality goes here."""
@@ -184,18 +141,16 @@ class GeorisquesMetadataUpdater(AddOn):
         self.time_limit = self.data["time_limit"]
         self.dry_run = self.data.get("dry_run", False)
         self.max_documents = self.data.get("max_documents", 0)
-        self.beautify_titles = self.data.get("beautify_titles", False)
 
-        self.processed_count = 0
+        self.read_count = 0
+        self.saved_count = 0
         self.failure_count = 0
-        self.title_count = 0
+        self.counts = Counter()
+        self.key_counts = Counter()
+        self.batch = []
 
         if self.dry_run:
             logger.info("Running in DRY-RUN mode: no document will be modified.")
-        if self.beautify_titles:
-            logger.info(
-                "Beautifying the titles of documents that have no original_filename."
-            )
 
         # Fetch & load Géorisques data (installations table + rubriques index)
         self.df_installations, self.rubriques_by_aiot = load_georisques_data()
@@ -205,32 +160,34 @@ class GeorisquesMetadataUpdater(AddOn):
         )
 
         try:
-            # 1 Documents never updated yet.
-            logger.info("Phase 1: documents with no last_metadata_update...")
-            non_updated_docs = self.client.documents.search(
-                f"project:{self.project} -data_last_metadata_update:*"
+            # Sorted by id so the cursor is stable while the run writes
+            documents = self.client.documents.search(
+                f"project:{self.project}", sort="id", per_page=PER_PAGE
             )
-            self.process_documents(non_updated_docs)
-
-            # 2 Already-updated documents, least-recently-updated first.
-            # Bound to documents stamped BEFORE this run started so a run never
-            # re-processes the docs that were updated in Phase 1.
-            logger.info("Phase 2: previously-updated documents (least recently first)...")
-            start_token = self.start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-            already_updated_docs = self.client.documents.search(
-                f'project:{self.project} '
-                f'data_last_metadata_update:[* TO "{start_token}"] '
-                f"sort:data_last_metadata_update"
-            )
-            self.process_documents(already_updated_docs)
+            logger.info(f"Comparing the project's {documents.count} documents with the CSV...")
+            for document in documents:
+                if self.max_documents and self.read_count >= self.max_documents:
+                    logger.info(f"Reached max_documents limit ({self.max_documents}); stopping.")
+                    break
+                self.check_time_limit()
+                self.read_count += 1
+                self.update_metadata(document)
+                if self.read_count % PROGRESS_EVERY == 0:
+                    logger.info(
+                        f"Read {self.read_count} documents so far, "
+                        f"{self.counts['changed']} changed..."
+                    )
+            self.flush()
         finally:
-            # Always report the total, whatever ended the run: natural completion,
+            # Always report the totals, whatever ended the run: natural completion,
             # the max_documents cap, the time limit (sys.exit), or the give-up abort.
-            summary = f"Run finished. Processed {self.processed_count} documents."
-            if self.beautify_titles:
-                verb = "would be beautified" if self.dry_run else "beautified"
-                summary += f" {self.title_count} title(s) {verb}."
-            logger.info(summary)
+            written = "would be written" if self.dry_run else f"{self.saved_count} written"
+            logger.info(
+                f"Run finished. Read {self.read_count} documents: {dict(self.counts) or 'none'}; "
+                f"changed documents {written}, {self.failure_count} failed."
+            )
+            if self.key_counts:
+                logger.info(f"Changes by key: {dict(sorted(self.key_counts.items()))}")
 
 
 if __name__ == "__main__":
