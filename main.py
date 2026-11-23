@@ -8,12 +8,20 @@ from documentcloud.exceptions import APIError
 
 from utils import (
     BULK_LIMIT,
+    DEPARTMENTS_KEY,
+    INSEE_KEY,
+    MUNICIPALITY_KEY,
+    POSTAL_KEY,
     REQUIRED_FIELDS,
+    InseeGeocoder,
     build_installation_data,
+    department_of,
     first_value,
+    keep,
     load_georisques_data,
     put_batch,
     put_item,
+    same_place,
     updated_data,
 )
 
@@ -60,7 +68,7 @@ class GeorisquesMetadataUpdater(AddOn):
                 logger.info(f"[dry-run]     {key}: {old!r} -> {new!r}")
 
     def update_metadata(self, document):
-        """Queue one document's write when its installation_* keys differ from the CSV.
+        """Queue one document's write when its installation keys or description differ from the CSV.
 
         A document with no AIOT code, or one the CSV no longer lists, is left untouched.
         """
@@ -74,8 +82,16 @@ class GeorisquesMetadataUpdater(AddOn):
             self.counts["installation_aiot_code not in the CSV"] += 1
             return
 
+        self.complete_place(code_aiot, data, target)
         new_data, changes = updated_data(data, target)
-        if new_data is None:
+        description = None
+        name = target.get("installation_name", "").strip()
+        # The scraper's description, shown as the folder name: it follows a renamed installation
+        stored_description = getattr(document, "description", None)
+        if name and stored_description != f"{name} ({code_aiot})":
+            description = f"{name} ({code_aiot})"
+            changes["description"] = (stored_description, description)
+        if not changes:
             self.counts["unchanged"] += 1
             return
 
@@ -92,11 +108,47 @@ class GeorisquesMetadataUpdater(AddOn):
             self.log_changes(document, changes)
             return
 
-        self.batch.append(put_item(document, new_data))
+        self.batch.append(put_item(document, new_data or data, description))
         if len(self.batch) >= BULK_LIMIT:
             self.flush()
 
+    def complete_place(self, code_aiot, data, target):
+        """Add to ``target`` what the scraper derives from the CSV: a geocoded INSEE code and the département."""
+        if INSEE_KEY not in target:
+            self.resolve_insee_code(code_aiot, data, target)
+        code_insee = first_value(target.get(INSEE_KEY))
+        if code_insee:
+            target[DEPARTMENTS_KEY] = department_of(code_insee)
+        else:
+            keep(data, target, (DEPARTMENTS_KEY,))
+
+    def resolve_insee_code(self, code_aiot, data, target):
+        """Geocode the CSV's place when the document has no code, or its place changed."""
+        stored_code = first_value(data.get(INSEE_KEY))
+        if stored_code and same_place(data, target):
+            keep(data, target, (INSEE_KEY, MUNICIPALITY_KEY))
+            return
+
+        postal, commune = target.get(POSTAL_KEY), target.get(MUNICIPALITY_KEY)
+        if postal and commune:
+            result, reason = self.geocoder.resolve(postal, commune)
+        else:
+            result, reason = None, "no postal code or commune"
+        if result:
+            target[INSEE_KEY] = result["code_insee"]
+            if result["commune"]:
+                target[MUNICIPALITY_KEY] = result["commune"]
+            return
+
+        if stored_code:
+            # The stored code stays with the place it came from, so the next run tries again
+            keep(data, target, (INSEE_KEY, MUNICIPALITY_KEY, POSTAL_KEY))
+        if reason != "geocoding stopped":
+            kept = "stored place kept" if stored_code else "CSV place used"
+            self.unresolved[(code_aiot, postal, commune, reason, kept)] += 1
+
     def flush(self):
+        """Write the queued documents to DocumentCloud in one bulk request, then empty the queue."""
         batch, self.batch = self.batch, []
         if not batch:
             return
@@ -148,6 +200,8 @@ class GeorisquesMetadataUpdater(AddOn):
         self.counts = Counter()
         self.key_counts = Counter()
         self.batch = []
+        self.geocoder = InseeGeocoder()
+        self.unresolved = Counter()
 
         if self.dry_run:
             logger.info("Running in DRY-RUN mode: no document will be modified.")
@@ -188,6 +242,14 @@ class GeorisquesMetadataUpdater(AddOn):
             )
             if self.key_counts:
                 logger.info(f"Changes by key: {dict(sorted(self.key_counts.items()))}")
+            logger.info(f"Geocoder: {dict(self.geocoder.stats) or 'no lookup'}.")
+            if self.unresolved:
+                logger.info(f"Unresolved INSEE codes: {sum(self.unresolved.values())} document(s).")
+            for (code_aiot, postal, commune, reason, kept), count in sorted(self.unresolved.items(), key=str):
+                logger.warning(
+                    f"AIOT {code_aiot}: no INSEE code for {postal} {commune} ({reason}): "
+                    f"{count} document(s), {kept}."
+                )
 
 
 if __name__ == "__main__":

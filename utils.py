@@ -1,5 +1,7 @@
+from collections import Counter
 import logging
 import os
+import re
 import time
 import zipfile
 
@@ -18,10 +20,10 @@ from tenacity import (
 
 logger = logging.getLogger(__name__)
 
-# Géorisques always cuts a CSV page of ~1.4 MB mid-download (6000 rows, 2026-11-20)
+# Géorisques cuts large CSVs mid-download
 PAGE_SIZE = 2000
 CSV_ENDPOINT = "https://georisques.gouv.fr/api/v1/csv/installations_classees?page_size={page_size}&page={page}"
-CSV_HEADERS = {"User-Agent": "Disclose Georisques Metadata Updater Add-On - contact tech@disclose.ngo"}
+HEADERS = {"User-Agent": "Disclose Georisques Metadata Updater Add-On - contact tech@disclose.ngo"}
 # Seconds between two CSV pages
 PAGE_DELAY = 5
 DOWNLOAD_FOLDER = "downloaded_files"
@@ -43,11 +45,16 @@ INSTALLATION_FIELD_MAP = {
     "raisonSociale": "installation_name",
 }
 
+INSEE_KEY = INSTALLATION_FIELD_MAP["codeInsee"]
+MUNICIPALITY_KEY = INSTALLATION_FIELD_MAP["commune"]
+POSTAL_KEY = INSTALLATION_FIELD_MAP["codePostal"]
+DEPARTMENTS_KEY = "departments"
+
 # Boolean theme columns aggregated into the installation_topics list.
 THEME_COLUMNS = ["bovins", "porcs", "volailles", "carriere", "eolienne", "industrie"]
 
-# Human-readable fields repaired for mixed Latin-1/UTF-8 mojibake + HTML entities
-# (the scraper's CleanTextPipeline). ftfy.fix_text is a no-op on clean text.
+# Text the CSV can hold garbled (UTF-8 read as Latin-1) or with HTML entities, repaired
+# with ftfy like the scraper's CleanTextPipeline; clean text comes out unchanged
 FTFY_KEYS = {"installation_name", "installation_address", "installation_municipality"}
 
 
@@ -60,10 +67,9 @@ def read_installations_csv(csv_path):
 
 
 def build_rubriques_by_aiot(csv_path):
-    """Aggregate rubriqueIC.csv into {codeAiot: sorted unique numeroRubrique}.
+    """{codeAiot: its nomenclature sections (numeroRubrique), unique and sorted}, as the scraper builds them.
 
-    rubriqueIC.csv has several rows per codeAiot (one per alinéa); the scraper
-    keeps the set of unique numeroRubrique, sorted.
+    rubriqueIC.csv has one row per alinéa, so a section repeats for one installation.
     """
     df = pd.read_csv(csv_path, sep=";", encoding="ISO-8859-1", dtype=str)
     df.fillna("", inplace=True)
@@ -82,12 +88,10 @@ def build_installation_address(row):
 
 
 def build_installation_data(code_aiot, df_installations, rubriques_by_aiot):
-    """Installation-level DocumentCloud ``data`` subset for one codeAiot.
+    """What the CSV says about one installation, as the data keys the scraper uploads.
 
-    Returns ``{}`` when the codeAiot is absent from the installations table.
-    Mirrors the scraper (add_installation_metadata/add_installation_adress +
-    CleanTextPipeline ftfy repair + UploadPipeline item->data-key mapping). Only
-    truthy values are emitted, matching the scraper (which never sets empty keys).
+    ``{}`` when the CSV doesn't list the codeAiot. Empty values are left out, as the scraper does;
+    the geocoded INSEE code and the département are added afterwards (main.complete_place).
     """
     if code_aiot not in df_installations.index:
         return {}
@@ -130,8 +134,8 @@ def build_installation_data(code_aiot, df_installations, rubriques_by_aiot):
     reraise=True,
 )
 def _download_csv_page(url):
-    """GET one Géorisques CSV page; bounded timeout + retry on transient errors."""
-    response = requests.get(url, headers=CSV_HEADERS, timeout=(60, 300))  # (connect, read)
+    """One Géorisques CSV page (a zip), retried on network and HTTP errors."""
+    response = requests.get(url, headers=HEADERS, timeout=(60, 300))  # (connect, read)
     response.raise_for_status()
     return response.content
 
@@ -177,6 +181,102 @@ def load_georisques_data():
     return df_installations, rubriques_by_aiot
 
 
+# INSEE code geocoding, as the scraper's InseeCodePipeline does when the CSV has no code
+GEOCODER_URL = "https://data.geopf.fr/geocodage/search/"
+# This many failed lookups in a row means the geocoder is down: no more lookups this run
+GEOCODER_MAX_FAILURES = 5
+
+
+@retry(
+    retry=retry_if_exception_type(requests.RequestException),
+    stop=stop_after_attempt(2),
+    reraise=True,
+)
+def _geocode(code_postal, commune):
+    """Properties of the geocoder's best match for "<postal code> <commune>", or None when nothing matches.
+
+    Raises RequestException on a network error, a 5xx or 429, or a reply of the wrong shape.
+    """
+    params = {"q": f"{code_postal} {commune}", "limit": 1}
+    response = requests.get(GEOCODER_URL, params=params, headers=HEADERS, timeout=10)
+    # A rejected query (4xx, bar 429) fails the same way every time: no match, not an outage
+    if 400 <= response.status_code < 500 and response.status_code != 429:
+        return None
+    response.raise_for_status()
+    body = response.json()
+    features = body.get("features") if isinstance(body, dict) else None
+    if not features:
+        return None
+    if not isinstance(features, list) or not isinstance(features[0], dict) or not isinstance(
+        features[0].get("properties"), dict
+    ):
+        raise requests.RequestException(f"Unexpected geocoder response: {body!r:.200}")
+    return features[0]["properties"]
+
+
+class InseeGeocoder:
+    """Finds the INSEE code of a (postal code, commune) with the scraper's rules.
+
+    Each place is looked up once per run: matches, misses and failures are all cached.
+    """
+
+    def __init__(self):
+        self.cache = {}
+        self.failures_in_a_row = 0
+        self.stats = Counter()
+
+    @property
+    def stopped(self):
+        return self.failures_in_a_row >= GEOCODER_MAX_FAILURES
+
+    def resolve(self, code_postal, commune):
+        """``(result, None)`` when the geocoder finds the place, else ``(None, reason)``.
+
+        ``result`` is ``{"code_insee", "commune"}``. ``commune`` is the geocoder's correct spelling when the
+        CSV name has a "?" in place of a letter (Crèvec?ur for Crèvecœur), else None.
+        """
+        key = (code_postal, commune)
+        if key in self.cache:
+            return self.cache[key]
+        if self.stopped:
+            return None, "geocoding stopped"
+
+        # The CSV holds characters Latin-1 lacks (œ) as "?", which the geocoder can't match
+        corrupted = "?" in commune
+        self.stats["lookups"] += 1
+        try:
+            props = _geocode(code_postal, commune.replace("?", "").strip()) or {}
+        except requests.RequestException as exc:
+            # Cached too, so one failing place counts once towards the breaker; the next run retries
+            self.stats["failed"] += 1
+            self.failures_in_a_row += 1
+            if self.stopped:
+                logger.warning(
+                    f"Geocoding stopped for this run after {GEOCODER_MAX_FAILURES} failed lookups in a row."
+                )
+            self.cache[key] = None, f"lookup failed: {exc!r}"
+            return self.cache[key]
+        self.failures_in_a_row = 0
+
+        if not props.get("citycode"):
+            outcome = None, "no match"
+        else:
+            corrected = None
+            # The geocoder's name replaces a "?" name only when its postcode is the CSV's
+            if corrupted and props.get("postcode") == code_postal:
+                corrected = props.get("city") or props.get("name")
+            outcome = {"code_insee": str(props["citycode"]), "commune": corrected}, None
+        self.stats["matched" if outcome[0] else "missed"] += 1
+        self.cache[key] = outcome
+        return outcome
+
+
+def department_of(code_insee):
+    """The département of an INSEE commune code, as the scraper's TagDepartmentsPipeline derives it."""
+    # Overseas départements and collectivités take three digits
+    return code_insee[:3] if code_insee[:2] in ("97", "98") else code_insee[:2]
+
+
 # ---------------------------------------------------------------------------
 # DocumentCloud data helpers
 # ---------------------------------------------------------------------------
@@ -195,11 +295,35 @@ def normalize_for_comparison(value):
     return [str(value)]
 
 
-# Every key build_installation_data() can emit: one the CSV no longer provides is deleted
+def same_place(data, target):
+    """Whether the document's postal code and commune are still the ones in the CSV."""
+    if first_value(data.get(POSTAL_KEY)) != target.get(POSTAL_KEY):
+        return False
+    stored, current = first_value(data.get(MUNICIPALITY_KEY)), target.get(MUNICIPALITY_KEY)
+    if stored is None or current is None:
+        return stored == current
+    # The scraper stores the geocoder's name for a "?" name: each "?" stands for one character
+    pattern = ".".join(re.escape(part) for part in current.split("?"))
+    return re.fullmatch(pattern, stored) is not None
+
+
+def keep(data, target, keys):
+    """Copy the document's current values for ``keys`` into ``target`` (or remove a key the document
+    lacks), so the update leaves those keys as they are.
+    """
+    for key in keys:
+        if key in data:
+            target[key] = data[key]
+        else:
+            target.pop(key, None)
+
+
+# Every key the updater writes: one missing from the target is deleted
 MANAGED_KEYS = set(INSTALLATION_FIELD_MAP.values()) | {
     "installation_topics",
     "installation_nomenclature_sections",
     "installation_address",
+    DEPARTMENTS_KEY,
 }
 
 
@@ -249,11 +373,13 @@ PUT_FIELDS = [
 ]
 
 
-def put_item(document, data):
-    """One bulk PUT entry: the document's writable fields with ``data`` replaced."""
+def put_item(document, data, description=None):
+    """One bulk PUT entry: the document's writable fields with ``data`` (and ``description``) replaced."""
     item = {"id": document.id}
     item |= {field: getattr(document, field) for field in PUT_FIELDS if hasattr(document, field)}
     item["data"] = data
+    if description is not None:
+        item["description"] = description
     return item
 
 

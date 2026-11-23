@@ -8,3 +8,7 @@ counterpart to the Géorisques scraper (`documentcloud-georisques-scraper`, whic
 initial upload): the scraper stamps each document with an `installation_aiot_code`, and this
 Add-On revisits those documents and refreshes their `installation_*` metadata from the
 current Géorisques CSV export.
+
+When a CSV row has no INSEE code, the Add-On geocodes the installation's commune with
+data.geopf.fr, as the scraper does, and derives `departments` from the code; a renamed
+installation's description (`<raison sociale> (<AIOT>)`) follows the new name.
