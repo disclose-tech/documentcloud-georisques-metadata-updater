@@ -76,6 +76,7 @@ def build_rubriques_by_aiot(csv_path):
 
     sets_by_aiot = {}
     for aiot, num in zip(df["codeAiot"], df["numeroRubrique"]):
+        num = num.strip()
         if num:
             sets_by_aiot.setdefault(aiot, set()).add(num)
     return {aiot: sorted(nums) for aiot, nums in sets_by_aiot.items()}
@@ -102,7 +103,8 @@ def build_installation_data(code_aiot, df_installations, rubriques_by_aiot):
 
     data = {}
     for csv_col, dc_key in INSTALLATION_FIELD_MAP.items():
-        value = row.get(csv_col, "")
+        # a padded value would be rewritten on every run
+        value = row.get(csv_col, "").strip()
         if value:
             data[dc_key] = value
 
@@ -120,7 +122,9 @@ def build_installation_data(code_aiot, df_installations, rubriques_by_aiot):
 
     for key in FTFY_KEYS:
         if key in data:
-            data[key] = ftfy.fix_text(data[key], unescape_html=True)
+            data[key] = ftfy.fix_text(data[key], unescape_html=True).strip()
+            if not data[key]:  # an entity-only value, e.g. "&nbsp;"
+                del data[key]
 
     return data
 

@@ -85,7 +85,7 @@ class GeorisquesMetadataUpdater(AddOn):
         self.complete_place(code_aiot, data, target)
         new_data, changes = updated_data(data, target)
         description = None
-        name = target.get("installation_name", "").strip()
+        name = target.get("installation_name", "")
         # The scraper's description, shown as the folder name: it follows a renamed installation
         stored_description = getattr(document, "description", None)
         if name and stored_description != f"{name} ({code_aiot})":
