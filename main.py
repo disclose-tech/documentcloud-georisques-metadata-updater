@@ -5,6 +5,7 @@ import sys
 
 from documentcloud.addon import AddOn
 from documentcloud.exceptions import APIError
+import ftfy
 
 from utils import (
     BULK_LIMIT,
@@ -15,10 +16,12 @@ from utils import (
     REQUIRED_FIELDS,
     InseeGeocoder,
     build_installation_data,
+    build_title,
     department_of,
     first_value,
     keep,
     load_georisques_data,
+    matches_lossy,
     put_batch,
     put_item,
     same_place,
@@ -44,7 +47,7 @@ MAX_GIVE_UPS = 5
 
 
 class GeorisquesMetadataUpdater(AddOn):
-    """Reconciles every document's installation metadata with the Géorisques CSV."""
+    """Reconciles every document's installation metadata with Géorisques."""
 
     def check_time_limit(self):
         if self.time_limit != 0:
@@ -68,9 +71,10 @@ class GeorisquesMetadataUpdater(AddOn):
                 logger.info(f"[dry-run]     {key}: {old!r} -> {new!r}")
 
     def update_metadata(self, document):
-        """Queue one document's write when its installation keys or description differ from the CSV.
+        """Queue one document's write when its installation keys, description or "?"-damaged title
+        differ from Géorisques.
 
-        A document with no AIOT code, or one the CSV no longer lists, is left untouched.
+        A document with no AIOT code, or one Géorisques no longer lists, is left untouched.
         """
         data = document.data or {}
         code_aiot = first_value(data.get("installation_aiot_code"))
@@ -79,7 +83,7 @@ class GeorisquesMetadataUpdater(AddOn):
             return
         target = build_installation_data(code_aiot, self.df_installations, self.rubriques_by_aiot)
         if not target:
-            self.counts["installation_aiot_code not in the CSV"] += 1
+            self.counts["installation_aiot_code not in Géorisques"] += 1
             return
 
         self.complete_place(code_aiot, data, target)
@@ -91,6 +95,15 @@ class GeorisquesMetadataUpdater(AddOn):
         if name and stored_description != f"{name} ({code_aiot})":
             description = f"{name} ({code_aiot})"
             changes["description"] = (stored_description, description)
+        title = None
+        filename = self.repaired_filename(data)
+        if filename:
+            new_data = dict(new_data or data)
+            changes["original_filename"] = (first_value(data.get("original_filename")), filename)
+            new_data["original_filename"] = filename
+            title = self.repaired_title(document, data, filename)
+            if title:
+                changes["title"] = (document.title, title)
         if not changes:
             self.counts["unchanged"] += 1
             return
@@ -108,12 +121,38 @@ class GeorisquesMetadataUpdater(AddOn):
             self.log_changes(document, changes)
             return
 
-        self.batch.append(put_item(document, new_data or data, description))
+        self.batch.append(put_item(document, new_data or data, description, title))
         if len(self.batch) >= BULK_LIMIT:
             self.flush()
 
+    def repaired_filename(self, data):
+        """Géorisques's name for the document's file when the stored one lost characters to "?", else None."""
+        stored = first_value(data.get("original_filename"))
+        if not stored or "?" not in stored:
+            return None
+        raw = self.doc_names.get(first_value(data.get("file_id")))
+        if raw is None:
+            return None
+        # Cleaned as the scraper's CleanTextPipeline cleans a name before storing it
+        clean = ftfy.fix_text(raw, unescape_html=True).strip()
+        if clean == stored:  # Géorisques's own name has the "?"
+            return None
+        
+        if not (matches_lossy(stored, clean) or matches_lossy(stored, raw.strip())):
+            self.counts["original_filename kept (not a lost-character match)"] += 1
+            return None
+        return clean
+
+    def repaired_title(self, document, data, filename):
+        """The title rebuilt from the repaired file name, or None when someone set the title by hand."""
+        doc_type = first_value(data.get("doc_type"))
+        if document.title != build_title(doc_type, first_value(data.get("original_filename"))):
+            self.counts["title kept (not the built form)"] += 1
+            return None
+        return build_title(doc_type, filename)
+
     def complete_place(self, code_aiot, data, target):
-        """Add to ``target`` what the scraper derives from the CSV: a geocoded INSEE code and the département."""
+        """Add to ``target`` what the scraper derives from Géorisques: a geocoded INSEE code and the département."""
         if INSEE_KEY not in target:
             self.resolve_insee_code(code_aiot, data, target)
         code_insee = first_value(target.get(INSEE_KEY))
@@ -123,10 +162,14 @@ class GeorisquesMetadataUpdater(AddOn):
             keep(data, target, (DEPARTMENTS_KEY,))
 
     def resolve_insee_code(self, code_aiot, data, target):
-        """Geocode the CSV's place when the document has no code, or its place changed."""
+        """Geocode Géorisques's place when the document has no code, or its place changed.
+
+        The commune's name is fril the Géorisques API (the geocoder's for a "?" name), never the stored one,
+        which may hold the CSV export's "?".
+        """
         stored_code = first_value(data.get(INSEE_KEY))
         if stored_code and same_place(data, target):
-            keep(data, target, (INSEE_KEY, MUNICIPALITY_KEY))
+            keep(data, target, (INSEE_KEY,))
             return
 
         postal, commune = target.get(POSTAL_KEY), target.get(MUNICIPALITY_KEY)
@@ -141,10 +184,10 @@ class GeorisquesMetadataUpdater(AddOn):
             return
 
         if stored_code:
-            # The stored code stays with the place it came from, so the next run tries again
-            keep(data, target, (INSEE_KEY, MUNICIPALITY_KEY, POSTAL_KEY))
+            # The stored code stays with the postal code it came from, so the next run tries again
+            keep(data, target, (INSEE_KEY, POSTAL_KEY))
         if reason != "geocoding stopped":
-            kept = "stored place kept" if stored_code else "CSV place used"
+            kept = "stored place kept" if stored_code else "Géorisques place used"
             self.unresolved[(code_aiot, postal, commune, reason, kept)] += 1
 
     def flush(self):
@@ -206,8 +249,8 @@ class GeorisquesMetadataUpdater(AddOn):
         if self.dry_run:
             logger.info("Running in DRY-RUN mode: no document will be modified.")
 
-        # Fetch & load Géorisques data (installations table + rubriques index)
-        self.df_installations, self.rubriques_by_aiot = load_georisques_data()
+        # Fetch & load Géorisques data (installations table, rubriques index, file names)
+        self.df_installations, self.rubriques_by_aiot, self.doc_names = load_georisques_data()
         logger.info(
             f"Loaded {len(self.df_installations)} installations "
             f"({len(self.rubriques_by_aiot)} with rubriques)."
@@ -218,7 +261,7 @@ class GeorisquesMetadataUpdater(AddOn):
             documents = self.client.documents.search(
                 f"project:{self.project}", sort="id", per_page=PER_PAGE
             )
-            logger.info(f"Comparing the project's {documents.count} documents with the CSV...")
+            logger.info(f"Comparing the project's {documents.count} documents with Géorisques...")
             for document in documents:
                 if self.max_documents and self.read_count >= self.max_documents:
                     logger.info(f"Reached max_documents limit ({self.max_documents}); stopping.")

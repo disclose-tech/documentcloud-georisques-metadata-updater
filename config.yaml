@@ -1,6 +1,6 @@
 title: "Disclose Georisques Metadata Updater Add-On"
 description: >-
-  Compares every Georisques document's installation metadata with the latest Georisques CSV
+  Compares every Georisques document's installation metadata with the latest Georisques API data
   and updates the documents that differ.
 type: object
 documents: []
