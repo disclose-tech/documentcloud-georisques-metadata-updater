@@ -34,6 +34,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logging.getLogger("squarelet").setLevel(logging.WARNING)
+logging.getLogger("documentcloud").addFilter(
+    lambda record: not record.getMessage().startswith("Rate limit reached")
+)
 logger = logging.getLogger(__name__)
 
 # Log progress every this many read documents.
