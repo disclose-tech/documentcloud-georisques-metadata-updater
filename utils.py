@@ -442,12 +442,27 @@ def keep(data, target, keys):
             target.pop(key, None)
 
 
+# Marks a document this add-on made private because Géorisques blanked its installation. When the
+# name returns, only marked documents go public again: one made private by hand stays private
+WITHDRAWN_KEY = "installation_identity_withdrawn"
+
+# Past this percentage of nameless installations the read is considered broken
+MAX_BLANKED_PERCENT = 10
+
+
+def count_blanked(df_installations):
+    """How many installations Géorisques lists with no raison sociale."""
+    names = df_installations["raisonSociale"].str.strip()
+    return names[names == ""].index.nunique()
+
+
 # Every key the updater writes: one missing from the target is deleted
 MANAGED_KEYS = set(INSTALLATION_FIELD_MAP.values()) | {
     "installation_topics",
     "installation_nomenclature_sections",
     "installation_address",
     DEPARTMENTS_KEY,
+    WITHDRAWN_KEY,
 }
 
 
@@ -497,8 +512,9 @@ PUT_FIELDS = [
 ]
 
 
-def put_item(document, data, description=None, title=None):
-    """One bulk PUT entry: the document's writable fields with ``data`` (and ``description``, ``title``) replaced."""
+def put_item(document, data, description=None, title=None, access=None):
+    """One bulk PUT entry: the document's writable fields with ``data`` (and ``description``, ``title``,
+    ``access``) replaced."""
     item = {"id": document.id}
     item |= {field: getattr(document, field) for field in PUT_FIELDS if hasattr(document, field)}
     item["data"] = data
@@ -506,6 +522,8 @@ def put_item(document, data, description=None, title=None):
         item["description"] = description
     if title is not None:
         item["title"] = title
+    if access is not None:
+        item["access"] = access
     return item
 
 

@@ -12,3 +12,6 @@ Géorisques installations API.
 When an installation has no INSEE code, the Add-On geocodes the installation's commune with
 data.geopf.fr, as the scraper does, and derives `departments` from the code; a renamed
 installation's description (`<raison sociale> (<AIOT>)`) follows the new name.
+
+A document whose installation Géorisques has blanked (no name, no place) is made private, and
+public again once the name returns; a document made private by hand stays private.

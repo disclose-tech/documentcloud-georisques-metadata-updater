@@ -11,12 +11,15 @@ from utils import (
     BULK_LIMIT,
     DEPARTMENTS_KEY,
     INSEE_KEY,
+    MAX_BLANKED_PERCENT,
     MUNICIPALITY_KEY,
     POSTAL_KEY,
     REQUIRED_FIELDS,
+    WITHDRAWN_KEY,
     InseeGeocoder,
     build_installation_data,
     build_title,
+    count_blanked,
     department_of,
     first_value,
     keep,
@@ -78,6 +81,7 @@ class GeorisquesMetadataUpdater(AddOn):
         differ from Géorisques.
 
         A document with no AIOT code, or one Géorisques no longer lists, is left untouched.
+        One whose installation Géorisques has blanked goes private (see withdrawn_access).
         """
         data = document.data or {}
         code_aiot = first_value(data.get("installation_aiot_code"))
@@ -90,7 +94,10 @@ class GeorisquesMetadataUpdater(AddOn):
             return
 
         self.complete_place(code_aiot, data, target)
+        access = self.withdrawn_access(document, data, target)
         new_data, changes = updated_data(data, target)
+        if access:
+            changes["access"] = (document.access, access)
         description = None
         name = target.get("installation_name", "")
         # The scraper's description, shown as the folder name: it follows a renamed installation
@@ -118,15 +125,58 @@ class GeorisquesMetadataUpdater(AddOn):
             return
 
         self.counts["changed"] += 1
+        if access:
+            self.counts["made private (blanked)" if access == "private" else "made public (name back)"] += 1
         for key, (_old, new) in changes.items():
             self.key_counts[f"{key} {'deleted' if new is None else 'set'}"] += 1
         if self.dry_run:
             self.log_changes(document, changes)
             return
 
-        self.batch.append(put_item(document, new_data or data, description, title))
+        self.batch.append(put_item(document, new_data or data, description, title, access))
         if len(self.batch) >= BULK_LIMIT:
             self.flush()
+
+    def withdrawn_access(self, document, data, target):
+        """The document's new access when Géorisques blanked its installation or gave the name back, else None.
+
+        Sets the withdrawn marker in ``target`` along with it, and removes it once the document is public
+        again. A document made private by hand carries no marker, so it is never made public.
+        """
+        # The marker stays as stored unless a case below changes it
+        keep(data, target, (WITHDRAWN_KEY,))
+
+        # Blanked: a public document goes private and is marked withdrawn; any other is left alone
+        if not target.get("installation_name"):
+            if document.access != "public":
+                return None
+            access = "private"
+            target[WITHDRAWN_KEY] = "true"
+        # Named again after withdrawal
+        elif WITHDRAWN_KEY in data:
+            if document.access == "private":
+                # Back to public, marker kept until the next run: DocumentCloud makes a document public
+                # in a background task, and one that stalls would leave it private and unmarked
+                access = "public"
+            else:
+                # Already public (our switch finished, or a hand change): only the marker goes
+                target.pop(WITHDRAWN_KEY)
+                return None
+        # Named, no marker: a normal document, or one made private by hand, which stays private
+        else:
+            return None
+
+        # The change waits for a later run, marker as stored, when the read looks broken or the document
+        # isn't success
+        if self.access_paused:
+            reason = "paused (too many blanked)"
+        elif getattr(document, "status", None) != "success":
+            reason = "pending (not success)"
+        else:
+            return access
+        keep(data, target, (WITHDRAWN_KEY,))
+        self.counts[f"{access} {reason}"] += 1
+        return None
 
     def repaired_filename(self, data):
         """Géorisques's name for the document's file when the stored one lost characters to "?", else None."""
@@ -258,6 +308,15 @@ class GeorisquesMetadataUpdater(AddOn):
             f"Loaded {len(self.df_installations)} installations "
             f"({len(self.rubriques_by_aiot)} with rubriques)."
         )
+        blanked = count_blanked(self.df_installations)
+        installations = self.df_installations.index.nunique()
+        self.access_paused = blanked * 100 > MAX_BLANKED_PERCENT * installations
+        logger.info(f"Géorisques shows {blanked} of {installations} installations with no name (blanked).")
+        if self.access_paused:
+            logger.error(
+                f"Over {MAX_BLANKED_PERCENT} % of installations have no name, more than any real blanking: "
+                "a broken read? No document's access changes this run, and the run ends failed."
+            )
 
         try:
             # Sorted by id so the cursor is stable while the run writes
@@ -296,6 +355,8 @@ class GeorisquesMetadataUpdater(AddOn):
                     f"AIOT {code_aiot}: no INSEE code for {postal} {commune} ({reason}): "
                     f"{count} document(s), {kept}."
                 )
+        if self.access_paused:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
