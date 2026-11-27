@@ -446,6 +446,9 @@ def keep(data, target, keys):
 # name returns, only marked documents go public again: one made private by hand stays private
 WITHDRAWN_KEY = "installation_identity_withdrawn"
 
+# The date (YYYY-MM-DD) a run first found the installation's Géorisques page gone
+REMOVED_KEY = "source_page_removed"
+
 # Past this percentage of nameless installations the read is considered broken
 MAX_BLANKED_PERCENT = 10
 
@@ -463,6 +466,7 @@ MANAGED_KEYS = set(INSTALLATION_FIELD_MAP.values()) | {
     "installation_address",
     DEPARTMENTS_KEY,
     WITHDRAWN_KEY,
+    REMOVED_KEY,
 }
 
 

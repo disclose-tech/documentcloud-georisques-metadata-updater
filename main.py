@@ -11,9 +11,11 @@ from utils import (
     BULK_LIMIT,
     DEPARTMENTS_KEY,
     INSEE_KEY,
+    MANAGED_KEYS,
     MAX_BLANKED_PERCENT,
     MUNICIPALITY_KEY,
     POSTAL_KEY,
+    REMOVED_KEY,
     REQUIRED_FIELDS,
     WITHDRAWN_KEY,
     InseeGeocoder,
@@ -80,18 +82,19 @@ class GeorisquesMetadataUpdater(AddOn):
         """Queue one document's write when its installation keys, description or "?"-damaged title
         differ from Géorisques.
 
-        A document with no AIOT code, or one Géorisques no longer lists, is left untouched.
-        One whose installation Géorisques has blanked goes private (see withdrawn_access).
+        A document with no AIOT code is left untouched, and one Géorisques no longer lists is marked
+        removed (see mark_removed). One whose installation Géorisques has blanked goes private (see
+        withdrawn_access).
         """
         data = document.data or {}
         code_aiot = first_value(data.get("installation_aiot_code"))
         if not code_aiot:
             self.counts["no installation_aiot_code"] += 1
             return
-        target = build_installation_data(code_aiot, self.df_installations, self.rubriques_by_aiot)
-        if not target:
-            self.counts["installation_aiot_code not in Géorisques"] += 1
+        if code_aiot not in self.df_installations.index:
+            self.mark_removed(document, data, code_aiot)
             return
+        target = build_installation_data(code_aiot, self.df_installations, self.rubriques_by_aiot)
 
         self.complete_place(code_aiot, data, target)
         access = self.withdrawn_access(document, data, target)
@@ -117,12 +120,33 @@ class GeorisquesMetadataUpdater(AddOn):
         if not changes:
             self.counts["unchanged"] += 1
             return
+        self.queue(document, new_data or data, changes, description, title, access)
 
+    def mark_removed(self, document, data, code_aiot):
+        """A document whose installation Géorisques no longer lists keeps its stored values; the first time,
+        it's marked removed with the run's date, logged once per installation at the end of the run."""
+        self.counts["installation removed from Géorisques"] += 1
+        target = {}
+        keep(data, target, MANAGED_KEYS)
+        target.setdefault(REMOVED_KEY, self.today)
+        new_data, changes = updated_data(data, target)
+        if not changes:
+            return
+        # The PUT carries `access`, which DocumentCloud refuses while a document processes
+        if getattr(document, "status", None) in ("pending", "readable"):
+            self.counts["marked removed later (pending or readable)"] += 1
+            return
+        if self.queue(document, new_data, changes):
+            self.newly_removed.add((code_aiot, first_value(data.get("installation_name"))))
+
+    def queue(self, document, data, changes, description=None, title=None, access=None):
+        """Count a document's changes and queue its write (only logged in a dry run). False when it can't
+        be sent."""
         missing = [field for field in REQUIRED_FIELDS if getattr(document, field, None) is None]
         if missing:
             self.counts["skipped"] += 1
             logger.warning(f"{self.doc_label(document)}: skipped, no {', '.join(missing)} to send back.")
-            return
+            return False
 
         self.counts["changed"] += 1
         if access:
@@ -131,11 +155,12 @@ class GeorisquesMetadataUpdater(AddOn):
             self.key_counts[f"{key} {'deleted' if new is None else 'set'}"] += 1
         if self.dry_run:
             self.log_changes(document, changes)
-            return
+            return True
 
-        self.batch.append(put_item(document, new_data or data, description, title, access))
+        self.batch.append(put_item(document, data, description, title, access))
         if len(self.batch) >= BULK_LIMIT:
             self.flush()
+        return True
 
     def withdrawn_access(self, document, data, target):
         """The document's new access when Géorisques blanked its installation or gave the name back, else None.
@@ -278,6 +303,7 @@ class GeorisquesMetadataUpdater(AddOn):
         """The main add-on functionality goes here."""
 
         self.start_time = datetime.now(timezone.utc)
+        self.today = self.start_time.date().isoformat()
 
         # Add a custom user agent here to positively identify the Add-On
         self.client.session.headers.update(
@@ -298,6 +324,7 @@ class GeorisquesMetadataUpdater(AddOn):
         self.batch = []
         self.geocoder = InseeGeocoder()
         self.unresolved = Counter()
+        self.newly_removed = set()
 
         if self.dry_run:
             logger.info("Running in DRY-RUN mode: no document will be modified.")
@@ -347,6 +374,10 @@ class GeorisquesMetadataUpdater(AddOn):
             )
             if self.key_counts:
                 logger.info(f"Changes by key: {dict(sorted(self.key_counts.items()))}")
+            if self.newly_removed:
+                logger.info(f"Newly removed from Géorisques: {len(self.newly_removed)} installation(s).")
+            for code_aiot, name in sorted(self.newly_removed, key=str):
+                logger.info(f"AIOT {code_aiot}: {name or '(no stored name)'}")
             logger.info(f"Geocoder: {dict(self.geocoder.stats) or 'no lookup'}.")
             if self.unresolved:
                 logger.info(f"Unresolved INSEE codes: {sum(self.unresolved.values())} document(s).")
