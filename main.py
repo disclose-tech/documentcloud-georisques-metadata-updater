@@ -132,16 +132,18 @@ class GeorisquesMetadataUpdater(AddOn):
         new_data, changes = updated_data(data, target)
         if not changes:
             return
-        # The PUT carries `access`, which DocumentCloud refuses while a document processes
-        if getattr(document, "status", None) in ("pending", "readable"):
-            self.counts["marked removed later (pending or readable)"] += 1
-            return
         if self.queue(document, new_data, changes):
             self.newly_removed.add((code_aiot, first_value(data.get("installation_name"))))
 
     def queue(self, document, data, changes, description=None, title=None, access=None):
         """Count a document's changes and queue its write (only logged in a dry run). False when it can't
         be sent."""
+        # The PUT carries `access`, which DocumentCloud refuses while a document processes, even unchanged:
+        # the next runs compare the document again
+        if getattr(document, "status", None) in ("pending", "readable"):
+            self.counts["written later (pending or readable)"] += 1
+            return False
+
         missing = [field for field in REQUIRED_FIELDS if getattr(document, field, None) is None]
         if missing:
             self.counts["skipped"] += 1
